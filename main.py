@@ -31,27 +31,58 @@ def scrape_hotel(request: HotelRequest):
 
         soup = BeautifulSoup(response.content, "html.parser")
 
-        # --- 1. Hotel Name ---
-        # TripAdvisor usually puts the name in an H1 tag with id 'HEADING'
+        # --- 1. Hotel Name (Cleaned) ---
         hotel_name = "N/A"
         h1_tag = soup.find("h1", {"id": "HEADING"})
-        if h1_tag:
-            hotel_name = h1_tag.text.strip()
         
-        # --- 2. Hotel Description ---
-        # The easiest way to get the description on TA is the meta tag, 
-        # because the on-page text is often hidden behind a "Read more" button using JS.
+        if h1_tag:
+            # CLEANUP: Remove the "Claimed" badge/tooltip logic BEFORE getting text
+            # Find and destroy the badge/tooltip element
+            junk_badge = h1_tag.find(attrs={"data-automation": "listingBadgeTooltip"})
+            if junk_badge:
+                junk_badge.decompose()  # This deletes the tag from the HTML tree completely
+            
+            # Also remove any standalone SVGs (icons) inside the H1
+            for icon in h1_tag.find_all("svg"):
+                icon.decompose()
+
+            # Now extract only the remaining text
+            hotel_name = h1_tag.get_text(strip=True)
+        
+        # --- 2. Hotel Description (Targeting About Tab first) ---
         description = "N/A"
-        meta_desc = soup.find("meta", {"name": "description"}) or soup.find("meta", {"property": "og:description"})
-        if meta_desc:
-            description = meta_desc.get("content", "").strip()
+        
+        # Priority 1: Look for the specific "About" tab container
+        about_tab = soup.find(attrs={"data-automation": "aboutTabDescription"})
+        if about_tab:
+            # Get text with separator to prevent words merging across divs
+            description = about_tab.get_text(separator=" ", strip=True)
+            # Remove common "Read more" link text if captured
+            description = description.replace("Read more", "").strip()
+        
+        # Priority 2: Fallback to Meta tag if the specific tab isn't found
+        if description == "N/A" or not description:
+            meta_desc = soup.find("meta", {"name": "description"}) or soup.find("meta", {"property": "og:description"})
+            if meta_desc:
+                description = meta_desc.get("content", "").strip()
 
-        # --- 3. Rating & 4. Review Count ---
-        # TripAdvisor classes are dynamic (random letters), so we look for structure or aria-labels.
+        # --- 3. Contact Number ---
+        contact_number = "N/A"
+        # Look for <a href="tel:+91...">
+        phone_link = soup.find("a", href=re.compile(r"^tel:"))
+        if phone_link:
+            contact_number = phone_link.get("href").replace("tel:", "")
+        else:
+            # Look for scripts containing phone numbers
+            script_content = soup.find(string=re.compile(r"telephone"))
+            if script_content:
+                # Try to regex extract a phone number pattern
+                phone_match = re.search(r'"telephone":"([^"]+)"', script_content)
+                if phone_match:
+                    contact_number = phone_match.group(1)
+
+        # --- 4. Rating ---
         rating = "N/A"
-        review_count = "N/A"
-
-        # Attempt to find the specific review section
         # Look for the bubble rating usually found near the top
         rating_tag = soup.find("span", {"class": "uwJeR"}) # Common class for the number like "5.0"
         if not rating_tag:
@@ -62,49 +93,63 @@ def scrape_hotel(request: HotelRequest):
         else:
             rating = rating_tag.text.strip()
 
-        # Look for review count
-        count_tag = soup.find("span", string=re.compile(r"reviews"))
-        if count_tag:
-            text = count_tag.text
-            # Extract numbers from "880 reviews" -> "880"
-            numbers = re.findall(r'[\d,]+', text)
-            if numbers:
-                review_count = numbers[0].replace(",", "")
+        # --- 5. Review Count (Targeted) ---
+        review_count = "N/A"
+        # Look for the element with the specific automation tag
+        review_tag = soup.find(attrs={"data-automation": "bubbleReviewCount"})
 
-        # --- 5. Images ---
+        if review_tag:
+            # Text will look like "(833 reviews)"
+            text = review_tag.text.strip()
+            # Use Regex to extract only the numbers (handles commas like 1,000)
+            match = re.search(r'([\d,]+)', text)
+            if match:
+                review_count = match.group(1).replace(",", "") 
+
+        # --- 6. MAIN IMAGES (High Quality Only) ---
         images = []
-        # Find images in the photo grid or gallery
-        # TA creates dynamic classes, so we look for img tags with large dimensions or specific container patterns
+        # Find all images
+        img_tags = soup.find_all("img")
         
-        # Strategy: Look for all images, filter for high res (usually source contains 'photo-')
-        all_imgs = soup.find_all("img")
-        
-        for img in all_imgs:
-            src = img.get("src")
-            # TripAdvisor images often have 'media' or 'photo' in URL. 
-            # We exclude small generic icons like 'blank.gif' or 'svg'
-            if src and "http" in src and (".jpg" in src or ".jpeg" in src):
-                if "w=50" not in src and "logo" not in src and "avatar" not in src:
-                     # Attempt to get higher resolution if available in data-lazyload-src
-                    high_res = img.get("data-lazyurl") or img.get("data-src") or src
-                    if high_res not in images:
-                        images.append(high_res)
+        for img in img_tags:
+            # TripAdvisor often puts the real URL in data-lazyurl or data-src to prevent load lag
+            src = img.get("data-lazyurl") or img.get("data-src") or img.get("src")
             
+            if src and "media/photo-" in src:
+                # 1. Filter out user avatars, icons, and map markers
+                if any(x in src for x in ["avatar", "logo", "icon", "map_pin", ".svg", "blank.gif"]):
+                    continue
+
+                # 2. Logic to get High Res
+                # URLs look like: https://media-cdn.tripadvisor.com/media/photo-s/29/08/...jpg
+                # We try to force 'photo-w' (wide) for better quality
+                high_res_src = re.sub(r'/media/photo-[sflmt]/', '/media/photo-w/', src)
+                
+                # Clean URL (remove query parameters like ?w=50&h=50)
+                if "?" in high_res_src:
+                    high_res_src = high_res_src.split("?")[0]
+
+                if high_res_src not in images:
+                    images.append(high_res_src)
+            
+            # 3. Stop after grabbing the main hero images (usually top 10)
             if len(images) >= 10:
                 break
 
         return {
             "status": "success",
             "data": {
-                "Hotel Name": hotel_name,
-                "Hotel Description": description,
-                "Hotel review rating": rating,
-                "Total review count": review_count,
+                "hotel_name": hotel_name,
+                "hotel_description": description,
+                "contact_number": contact_number,
+                "hotel_review_rating": rating,
+                "total_review_count": review_count,
                 "images": images
             }
         }
 
     except Exception as e:
+        print(f"Error scraping hotel: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
